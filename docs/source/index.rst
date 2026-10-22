@@ -24,7 +24,6 @@
     guides/resume
     guides/jet
     guides/agents
-    guides/lfr
     cache_dir
     cli
 
