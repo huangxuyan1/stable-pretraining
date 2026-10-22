@@ -1,7 +1,10 @@
-"""Small CPU validation of LFR on scikit-learn's real handwritten digits.
+"""
+LFR on Handwritten Digits
+=========================
 
-This is an independent known-data check, not a reproduction of the paper's
-CIFAR-10 schedule::
+Small CPU validation of LFR on scikit-learn's real handwritten digits. This is
+an independent known-data check, not a reproduction of the paper's CIFAR-10
+schedule::
 
     python examples/lfr_digits.py --output-dir ./lfr-digits-run
 """
