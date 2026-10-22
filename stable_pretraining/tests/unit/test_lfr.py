@@ -320,7 +320,7 @@ def test_forward_freezes_targets_and_exposes_embedding_and_label() -> None:
     assert set(model(batch, stage="predict")) == {"embedding", "label"}
 
 
-def test_forward_sums_the_loss_over_projectors() -> None:
+def test_forward_averages_the_loss_over_projectors() -> None:
     model = tiny_lfr().eval()
     images = torch.randn(4, 3, 32, 32)
     with torch.no_grad():
@@ -328,7 +328,7 @@ def test_forward_sums_the_loss_over_projectors() -> None:
         expected = sum(
             model.lfr_loss(predictor(embedding), projector(images))
             for projector, predictor in zip(model.projectors, model.predictors)
-        )
+        ) / len(model.projectors)
         actual = model({"image": images}, stage="validate")["loss"]
     torch.testing.assert_close(actual, expected)
 

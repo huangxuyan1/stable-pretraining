@@ -50,6 +50,7 @@ def _compare_global_batch(rank, rendezvous):
             + reference.lfr_loss.lambd
             * (similarity.square().sum() - diagonal.square().sum())
         )
+    expected = expected / len(reference.projectors)
     expected.backward()
 
     ddp = DistributedDataParallel(model, find_unused_parameters=True)

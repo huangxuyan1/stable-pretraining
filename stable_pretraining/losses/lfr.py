@@ -16,9 +16,9 @@ class BatchwiseBarlowTwinsLoss(nn.Module):
         loss = sum_i (1 - c_ii)^2 + lambd * sum_{i != j} c_ij^2
 
     Unlike :class:`BarlowTwinsLoss`, the similarity matrix is ``B x B``
-    (samples), not ``D x D`` (features). Sum over projectors for the full LFR
-    objective. Similarities are computed in float32 so the ``B^2`` sum cannot
-    overflow under mixed precision.
+    (samples), not ``D x D`` (features). Average over projectors for the full
+    LFR objective, as the authors' code does. Similarities are computed in
+    float32 so the ``B^2`` sum cannot overflow under mixed precision.
 
     Under DDP, local predictions are compared against targets gathered from
     every rank, so negatives span the **global** batch. The local value is

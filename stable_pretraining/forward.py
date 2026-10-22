@@ -1268,7 +1268,7 @@ def lfr(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
 
     The encoder sees a single, unaugmented view. Each predictor head maps the
     embedding to the output of one frozen random projector, and the batch-wise
-    Barlow Twins loss is summed over projectors.
+    Barlow Twins loss is averaged over projectors.
 
     Args:
         self: Module instance (automatically bound) with required attributes:
@@ -1284,7 +1284,8 @@ def lfr(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
     Returns:
         Dictionary containing:
             - 'embedding': Encoder representations
-            - 'loss': Summed LFR loss (all stages except ``"predict"``)
+            - 'loss': LFR loss averaged over projectors (all stages except
+              ``"predict"``)
             - 'label': Labels if present (for probes/callbacks)
 
     Note:
@@ -1331,10 +1332,15 @@ def lfr(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
     target_inputs = inputs.float() if inputs.is_floating_point() else inputs
     with torch.no_grad(), torch.autocast(inputs.device.type, enabled=False):
         targets = [projector(target_inputs) for projector in self.projectors]
-    out["loss"] = sum(
-        self.lfr_loss(predictor(embedding), target)
-        for predictor, target in zip(self.predictors, targets)
-    )
+    # Average over projectors as in the authors' code: the paper's Eq. 5 sums,
+    # which scales gradients by the number of projectors and makes the
+    # published learning rate diverge with 40 projectors.
+    out["loss"] = torch.stack(
+        [
+            self.lfr_loss(predictor(embedding), target)
+            for predictor, target in zip(self.predictors, targets)
+        ]
+    ).mean()
     # Direct calls (outside a running Trainer stage) must not log.
     if self._trainer is not None and self.trainer.state.stage is not None:
         self.log(

@@ -50,9 +50,11 @@ probes and other callbacks keep training in every phase.
 
 ## Implementation notes
 
-- **Loss scale.** The loss is summed over samples and projectors, as in the
-  paper's Eq. 5. The authors' code averages over projectors instead, which
-  only rescales the learning rate.
+- **Loss scale.** The loss is summed over samples and **averaged over
+  projectors**, as in the authors' code. The paper's Eq. 5 sums over
+  projectors, but that multiplies gradients by the number of projectors: with
+  the paper's 40 projectors and learning rate 0.03, a summed loss diverged to
+  NaN within two epochs on CIFAR-10.
 - **Distributed training.** Negatives span the global batch: local
   predictions are compared against targets gathered from every rank, and DDP
   gradients equal those of one process seeing the whole batch. Use
