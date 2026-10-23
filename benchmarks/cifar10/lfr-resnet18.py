@@ -4,7 +4,8 @@ Pretraining uses unaugmented images only. After training, the frozen encoder
 and an untrained copy with the same initialization are each evaluated with
 the paper's linear protocol, so the gain over random features is measured
 under one budget. The paper reports 64.3% (LFR) and 34.7% (random init) after
-400 cycles; pass ``--cycles`` for shorter runs.
+400 cycles; pass ``--cycles`` for shorter runs. Training metrics
+(``metrics.csv``) and ``summary.json`` are written under ``--output-dir``.
 
     python benchmarks/cifar10/lfr-resnet18.py --cycles 50 --output-dir runs/lfr
 """
@@ -20,7 +21,6 @@ import torch
 import torch.nn as nn
 import torchmetrics
 import torchvision
-from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
 import stable_pretraining as spt
@@ -46,6 +46,10 @@ args = parser.parse_args()
 
 pl.seed_everything(args.seed, workers=True)
 args.output_dir.mkdir(parents=True, exist_ok=True)
+# Manager writes metrics under ``<cache_dir>/runs/``. Its per-epoch requeue
+# checkpoint (about 1.3 GB with 40 projectors) is only needed to resume
+# preempted jobs, so it is off for the 2,400-epoch schedule.
+spt.set(cache_dir=str(args.output_dir), requeue_checkpoint=False)
 
 # LFR needs no augmentation: training and evaluation share one transform.
 transform = transforms.Compose(
@@ -139,7 +143,6 @@ trainer = pl.Trainer(
     num_sanity_val_steps=0,
     callbacks=[knn_probe, linear_probe],
     precision="16-mixed" if device == "cuda" else "32-true",
-    logger=CSVLogger(save_dir=str(args.output_dir), name="lfr"),
     enable_checkpointing=False,
 )
 spt.Manager(trainer=trainer, module=module, data=data, seed=args.seed)()

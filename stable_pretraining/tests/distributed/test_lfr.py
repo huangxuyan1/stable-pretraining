@@ -94,6 +94,18 @@ def _alternate_phases(rank, rendezvous):
     dist.destroy_process_group()
 
 
+def _validate_uneven_batches(rank, rendezvous):
+    _init(rank, rendezvous)
+    torch.manual_seed(29)
+    model = tiny_lfr().eval()
+    # Validation loaders keep the last partial batch, so ranks can disagree.
+    images = torch.randn(3 + rank, 3, 32, 32)
+    with torch.no_grad():
+        loss = model({"image": images}, stage="validate")["loss"]
+    assert torch.isfinite(loss)
+    dist.destroy_process_group()
+
+
 @pytest.mark.distributed
 @pytest.mark.regression
 def test_lfr_ddp_matches_global_loss_and_gradients(tmp_path):
@@ -109,6 +121,16 @@ def test_lfr_ddp_matches_global_loss_and_gradients(tmp_path):
 def test_lfr_ddp_alternates_frozen_halves_without_desync(tmp_path):
     mp.spawn(
         _alternate_phases,
+        args=((tmp_path / "rendezvous").as_uri(),),
+        nprocs=WORLD_SIZE,
+    )
+
+
+@pytest.mark.distributed
+@pytest.mark.regression
+def test_lfr_ddp_validation_tolerates_uneven_batches(tmp_path):
+    mp.spawn(
+        _validate_uneven_batches,
         args=((tmp_path / "rendezvous").as_uri(),),
         nprocs=WORLD_SIZE,
     )

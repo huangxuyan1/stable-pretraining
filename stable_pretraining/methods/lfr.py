@@ -110,7 +110,16 @@ def random_image_projector(dim: int, in_channels: int = 3) -> nn.Module:
 
 
 def predictor_mlp(in_dim: int, out_dim: int, hidden_dim: int = 256) -> nn.Module:
-    """Build the paper's four-layer ReLU prediction head."""
+    """Build the paper's four-layer ReLU prediction head.
+
+    Args:
+        in_dim: Encoder embedding width.
+        out_dim: Width of the projector output to predict.
+        hidden_dim: Width of the three hidden layers.
+
+    Returns:
+        A trainable MLP mapping ``[B, in_dim]`` to ``[B, out_dim]``.
+    """
     return nn.Sequential(
         nn.Linear(in_dim, hidden_dim),
         nn.ReLU(),
@@ -122,8 +131,51 @@ def predictor_mlp(in_dim: int, out_dim: int, hidden_dim: int = 256) -> nn.Module
     )
 
 
+def _subsample(sample: torch.Tensor, max_samples: int) -> torch.Tensor:
+    """Deterministically keep at most ``max_samples`` rows of ``sample``."""
+    if sample.shape[0] <= max_samples:
+        return sample
+    keep = torch.randperm(sample.shape[0], generator=torch.Generator().manual_seed(0))
+    return sample[keep[:max_samples].to(sample.device)]
+
+
+def _signature(projector: nn.Module, sample: torch.Tensor) -> torch.Tensor:
+    """Unit-norm, flattened ``B x B`` cosine-similarity matrix of a projector."""
+    projector = projector.to(sample.device)
+    was_training = projector.training
+    projector.eval()
+    with torch.no_grad():
+        output = projector(sample)
+    projector.train(was_training)
+    if output.ndim != 2 or output.shape[0] != sample.shape[0]:
+        raise ValueError("each projector must return [B, D]")
+    normalized = F.normalize(output.float(), dim=1)
+    return F.normalize((normalized @ normalized.T).flatten(), dim=0)
+
+
+def _greedy_dpp(signatures: torch.Tensor, count: int) -> list[int]:
+    """Greedy MAP selection of a DPP whose kernel is the signatures' Gram matrix."""
+    kernel = (signatures @ signatures.T).double()
+    # Signatures have unit norm, so every candidate ties at the first step;
+    # start from the first candidate instead of breaking the tie by rounding.
+    selected: list[int] = [0]
+    remaining = set(range(1, signatures.shape[0]))
+    for _ in range(count - 1):
+        chosen = kernel[selected][:, selected]
+        cross = kernel[:, selected]
+        conditional = cross @ torch.linalg.pinv(chosen) * cross
+        scores = kernel.diagonal() - conditional.sum(dim=1)
+        index = max(remaining, key=lambda i: (scores[i].item(), -i))
+        selected.append(index)
+        remaining.remove(index)
+    return selected
+
+
 def select_diverse_projectors(
-    projectors: Sequence[nn.Module], sample: torch.Tensor, count: int
+    projectors: Sequence[nn.Module],
+    sample: torch.Tensor,
+    count: int,
+    max_samples: int = 1000,
 ) -> list[int]:
     """Greedily select the most diverse projectors, as the paper's DPP step.
 
@@ -135,8 +187,10 @@ def select_diverse_projectors(
 
     Args:
         projectors: Randomly initialized candidate projectors.
-        sample: One unlabeled batch, on the projectors' device.
+        sample: One unlabeled batch.
         count: Number of projectors to retain.
+        max_samples: Rows of ``sample`` to use at most. Signatures grow with
+            the square of this; the authors cap it at 1000.
 
     Returns:
         Candidate indices in selection order.
@@ -145,32 +199,9 @@ def select_diverse_projectors(
         raise ValueError("count must be between 1 and len(projectors)")
     if sample.shape[0] < 2:
         raise ValueError("selection sample needs at least two examples")
-    signatures = []
-    with torch.no_grad():
-        for projector in projectors:
-            was_training = projector.training
-            projector.eval()
-            output = projector(sample)
-            projector.train(was_training)
-            if output.ndim != 2 or output.shape[0] != sample.shape[0]:
-                raise ValueError("each projector must return [B, D]")
-            normalized = F.normalize(output.float(), dim=1)
-            signatures.append(F.normalize((normalized @ normalized.T).flatten(), dim=0))
-    signatures = torch.stack(signatures).double()
-    kernel = signatures @ signatures.T
-    # Signatures have unit norm, so every candidate ties at the first step;
-    # start from the first candidate instead of breaking the tie by rounding.
-    selected: list[int] = [0]
-    remaining = set(range(1, len(projectors)))
-    for _ in range(count - 1):
-        chosen = kernel[selected][:, selected]
-        cross = kernel[:, selected]
-        conditional = cross @ torch.linalg.pinv(chosen) * cross
-        scores = kernel.diagonal() - conditional.sum(dim=1)
-        index = max(remaining, key=lambda i: (scores[i].item(), -i))
-        selected.append(index)
-        remaining.remove(index)
-    return selected
+    sample = _subsample(sample, max_samples)
+    signatures = torch.stack([_signature(p, sample) for p in projectors])
+    return _greedy_dpp(signatures, count)
 
 
 def _output_dim(module: nn.Module, sample: torch.Tensor) -> int:
@@ -296,6 +327,7 @@ class LFR(Module):
                 random_image_projector(target_dim)
                 for _ in range(num_projectors * candidate_ratio)
             ]
+        pool_size = len(projectors)
         if len(projectors) < num_projectors:
             raise ValueError("provide at least as many projectors as predictors")
         if len(projectors) > num_projectors:
@@ -336,7 +368,10 @@ class LFR(Module):
                 predictor_hidden_dim=predictor_hidden_dim,
                 predictor_epochs=predictor_epochs,
                 lambd=lambd,
-                candidate_ratio=candidate_ratio,
+                # Selection has already happened and the checkpoint stores the
+                # chosen projectors, so reloading must not draw a new pool.
+                candidate_ratio=1,
+                projector_pool_size=pool_size,
                 low_resolution=low_resolution,
                 pretrained=pretrained,
                 input_key=input_key,
@@ -346,7 +381,15 @@ class LFR(Module):
             self.save_hyperparameters({"encoder_name": encoder_name})
 
     def max_epochs_for(self, cycles: int) -> int:
-        """Number of Trainer epochs covering ``cycles`` encoder epochs."""
+        """Number of Trainer epochs covering ``cycles`` encoder epochs.
+
+        Args:
+            cycles: Encoder epochs, each followed by ``predictor_epochs``
+                predictor epochs.
+
+        Returns:
+            The value to pass as ``Trainer(max_epochs=...)``.
+        """
         return cycles * (1 + self.predictor_epochs)
 
     @property
@@ -366,7 +409,8 @@ class LFR(Module):
         from lightning.pytorch.strategies import DDPStrategy
 
         strategy = getattr(self.trainer, "strategy", None)
-        if isinstance(strategy, DDPStrategy) and not strategy._ddp_kwargs.get(
+        ddp_kwargs = getattr(strategy, "_ddp_kwargs", None) or {}
+        if isinstance(strategy, DDPStrategy) and not ddp_kwargs.get(
             "find_unused_parameters", False
         ):
             raise RuntimeError(
@@ -381,5 +425,10 @@ class LFR(Module):
         # Freezing parameters does not freeze BatchNorm running statistics.
         self.backbone.train(encoder_epoch)
         inactive = self.predictors if encoder_epoch else self.backbone
+        # With gradient accumulation, a partial window at the end of the last
+        # phase can leave gradients behind; the shared optimizer would apply
+        # them to the half that is now frozen.
+        for parameter in inactive.parameters():
+            parameter.grad = None
         with _frozen(inactive):
             return super().training_step(batch, batch_idx)

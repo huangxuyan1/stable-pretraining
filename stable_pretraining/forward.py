@@ -1337,7 +1337,9 @@ def lfr(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
     # published learning rate diverge with 40 projectors.
     out["loss"] = torch.stack(
         [
-            self.lfr_loss(predictor(embedding), target)
+            # Validation/test batches may differ in size across ranks, so only
+            # training gathers negatives from every rank.
+            self.lfr_loss(predictor(embedding), target, gather=stage == "fit")
             for predictor, target in zip(self.predictors, targets)
         ]
     ).mean()

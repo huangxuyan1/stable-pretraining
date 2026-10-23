@@ -1,6 +1,7 @@
 """Unit tests for Learning From Randomness (LFR)."""
 
 import math
+from functools import partial
 
 import lightning as pl
 import numpy as np
@@ -434,3 +435,91 @@ def test_plain_ddp_strategy_is_rejected_with_a_fix() -> None:
         model.setup("fit")
     model.trainer = tiny_trainer(strategy=DDPStrategy(find_unused_parameters=True))
     model.setup("fit")
+
+
+# --- review regressions -----------------------------------------------------
+
+
+def _epoch_weights(model: LFR, max_epochs: int, **kwargs) -> list[dict]:
+    """Encoder and predictor weights at the start and after every epoch."""
+    states = []
+
+    class _Record(pl.Callback):
+        def _snapshot(self) -> None:
+            states.append(
+                {
+                    "encoder": model.backbone.net[-1].weight.detach().clone(),
+                    "predictor": model.predictors[0][0].weight.detach().clone(),
+                }
+            )
+
+        def on_train_start(self, trainer, pl_module) -> None:
+            self._snapshot()
+
+        def on_train_epoch_end(self, trainer, pl_module) -> None:
+            self._snapshot()
+
+    trainer = tiny_trainer(max_epochs=max_epochs, callbacks=[_Record()], **kwargs)
+    # 12 samples in batches of 4: three batches per epoch.
+    trainer.fit(model, DataLoader(image_samples(12), batch_size=4, drop_last=True))
+    return states
+
+
+def test_accumulated_gradients_never_update_the_frozen_half() -> None:
+    torch.manual_seed(0)
+    # Accumulating over 2 of 3 batches leaves a partial window at each epoch end.
+    model = tiny_lfr(
+        optim={"optimizer": partial(torch.optim.SGD, lr=0.1), "frequency": 2}
+    )
+    start, encoder_epoch, predictor_epoch, encoder_again = _epoch_weights(model, 3)
+    assert not torch.equal(start["encoder"], encoder_epoch["encoder"])
+    assert torch.equal(start["predictor"], encoder_epoch["predictor"])
+    assert torch.equal(encoder_epoch["encoder"], predictor_epoch["encoder"])
+    assert not torch.equal(encoder_epoch["predictor"], predictor_epoch["predictor"])
+    assert torch.equal(predictor_epoch["predictor"], encoder_again["predictor"])
+
+
+def test_checkpoint_with_candidate_pool_reloads(tmp_path) -> None:
+    torch.manual_seed(0)
+    model = tiny_lfr(candidate_ratio=3, selection_sample=torch.randn(4, 3, 32, 32))
+    trainer = tiny_trainer(max_epochs=1, limit_train_batches=1)
+    trainer.fit(model, DataLoader(image_samples(), batch_size=4, drop_last=True))
+    checkpoint = tmp_path / "lfr.ckpt"
+    trainer.save_checkpoint(checkpoint)
+    restored = LFR.load_from_checkpoint(
+        checkpoint, encoder_name=TinyEncoder(), weights_only=False
+    )
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value, msg=name)
+
+
+def test_candidate_pool_keeps_the_diverse_selection() -> None:
+    sample = torch.randn(6, 3, 32, 32, generator=torch.Generator().manual_seed(1))
+    torch.manual_seed(5)
+    TinyEncoder()  # tiny_lfr builds its encoder first; consume the same draws
+    pool = [random_image_projector(6) for _ in range(2 * 4)]
+    chosen = select_diverse_projectors(pool, sample, count=2)
+    torch.manual_seed(5)
+    model = tiny_lfr(candidate_ratio=4, selection_sample=sample)
+    assert len(model.projectors) == 2
+    for projector, index in zip(model.projectors, chosen):
+        for kept, expected in zip(projector.parameters(), pool[index].parameters()):
+            torch.testing.assert_close(kept, expected)
+
+
+def test_projector_selection_caps_the_sample_size() -> None:
+    torch.manual_seed(2)
+    candidates = [nn.Sequential(nn.Linear(5, 8), nn.ReLU()) for _ in range(10)]
+    sample = torch.randn(32, 5)
+    subset = torch.randperm(32, generator=torch.Generator().manual_seed(0))[:8]
+    capped = select_diverse_projectors(candidates, sample, count=4, max_samples=8)
+    assert capped == select_diverse_projectors(candidates, sample[subset], count=4)
+
+
+def test_loss_without_gather_uses_only_the_local_batch() -> None:
+    torch.manual_seed(3)
+    prediction, target = torch.randn(5, 4), torch.randn(5, 4)
+    criterion = BatchwiseBarlowTwinsLoss()
+    torch.testing.assert_close(
+        criterion(prediction, target, gather=False), criterion(prediction, target)
+    )

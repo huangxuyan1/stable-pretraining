@@ -20,11 +20,13 @@ class BatchwiseBarlowTwinsLoss(nn.Module):
     LFR objective, as the authors' code does. Similarities are computed in
     float32 so the ``B^2`` sum cannot overflow under mixed precision.
 
-    Under DDP, local predictions are compared against targets gathered from
-    every rank, so negatives span the **global** batch. The local value is
-    scaled by the world size: averaging it across ranks gives the global-batch
-    loss, and DDP's averaged gradients equal those of a single process seeing
-    the whole batch. Local batch sizes must be equal across ranks.
+    Under DDP with ``gather=True`` (training), local predictions are compared
+    against targets gathered from every rank, so negatives span the **global**
+    batch. The local value is scaled by the world size: averaging it across
+    ranks gives the global-batch loss, and DDP's averaged gradients equal those
+    of a single process seeing the whole batch. Local batch sizes must then be
+    equal across ranks. ``gather=False`` uses only the local batch, which is
+    safe when ranks see different batch sizes (validation, testing).
 
     Args:
         lambd: Weight of the off-diagonal squared cosine similarities.
@@ -36,26 +38,33 @@ class BatchwiseBarlowTwinsLoss(nn.Module):
             raise ValueError("lambd must be non-negative")
         self.lambd = lambd
 
-    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, prediction: torch.Tensor, target: torch.Tensor, gather: bool = True
+    ) -> torch.Tensor:
         """Compute the sample-wise Barlow Twins objective.
 
         Args:
             prediction: Predictor outputs with shape ``[B, D]``.
             target: Random-projector outputs with shape ``[B, D]``.
+            gather: Use targets from every rank as negatives (training).
 
         Returns:
             Scalar float32 loss, summed over samples.
         """
         if prediction.ndim != 2 or prediction.shape != target.shape:
             raise ValueError("prediction and target must have matching [B, D] shapes")
-        world_size = get_world_size()
+        world_size = get_world_size() if gather else 1
         if prediction.shape[0] * world_size < 2:
-            raise ValueError("the global batch must contain at least 2 samples")
+            raise ValueError("the batch must contain at least 2 samples")
         prediction = F.normalize(prediction.float(), dim=1)
-        targets = torch.cat(all_gather(F.normalize(target.float(), dim=1)), dim=0)
+        targets = F.normalize(target.float(), dim=1)
+        offset = 0
+        if gather:
+            targets = torch.cat(all_gather(targets), dim=0)
+            offset = get_rank() * prediction.shape[0]
         similarity = prediction @ targets.T
         local = torch.arange(prediction.shape[0], device=prediction.device)
-        diagonal = similarity[local, get_rank() * prediction.shape[0] + local]
+        diagonal = similarity[local, offset + local]
         loss = (1 - diagonal).square().sum() + self.lambd * (
             similarity.square().sum() - diagonal.square().sum()
         )
